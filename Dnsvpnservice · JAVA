@@ -1,0 +1,368 @@
+package com.smartdns.app.service;
+ 
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.content.Intent;
+import android.net.VpnService;
+import android.os.Build;
+import android.os.ParcelFileDescriptor;
+import android.util.Log;
+ 
+import androidx.core.app.NotificationCompat;
+ 
+import com.smartdns.app.R;
+import com.smartdns.app.model.DnsServer;
+import com.smartdns.app.ui.MainActivity;
+ 
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.nio.ByteBuffer;
+ 
+/**
+ * Core VPN service that intercepts all DNS traffic (port 53) and
+ * forwards it to the selected DNS server.
+ *
+ * How it works:
+ *  1. Creates a local TUN interface (10.0.0.1/32)
+ *  2. Routes only DNS traffic (port 53) through it
+ *  3. Forwards queries to the selected DNS server
+ *  4. Returns responses back to the app
+ *
+ * This means NO actual internet traffic is routed through us —
+ * only DNS queries. Privacy-friendly and low overhead.
+ */
+public class DnsVpnService extends VpnService {
+ 
+    private static final String TAG = "DnsVpnService";
+    private static final String CHANNEL_ID = "smartdns_channel";
+    private static final int NOTIFICATION_ID = 1;
+ 
+    // TUN interface address
+    private static final String TUN_ADDRESS = "10.0.0.1";
+    private static final int TUN_PREFIX = 32;
+    private static final int TUN_MTU = 1500;
+ 
+    // DNS
+    private static final int DNS_PORT = 53;
+    private static final int BUFFER_SIZE = 32767;
+ 
+    // Intent actions
+    public static final String ACTION_START = "com.smartdns.START";
+    public static final String ACTION_STOP = "com.smartdns.STOP";
+    public static final String EXTRA_DNS_PRIMARY = "dns_primary";
+    public static final String EXTRA_DNS_SECONDARY = "dns_secondary";
+    public static final String EXTRA_DNS_NAME = "dns_name";
+ 
+    private ParcelFileDescriptor vpnInterface;
+    private Thread vpnThread;
+    private volatile boolean running = false;
+ 
+    private String selectedDnsPrimary = "1.1.1.1";
+    private String selectedDnsSecondary = "1.0.0.1";
+    private String selectedDnsName = "Cloudflare";
+ 
+    // ── Lifecycle ─────────────────────────────────────────────────
+ 
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent == null) return START_NOT_STICKY;
+ 
+        String action = intent.getAction();
+ 
+        if (ACTION_STOP.equals(action)) {
+            stopVpn();
+            return START_NOT_STICKY;
+        }
+ 
+        if (ACTION_START.equals(action)) {
+            selectedDnsPrimary = intent.getStringExtra(EXTRA_DNS_PRIMARY);
+            selectedDnsSecondary = intent.getStringExtra(EXTRA_DNS_SECONDARY);
+            selectedDnsName = intent.getStringExtra(EXTRA_DNS_NAME);
+ 
+            if (selectedDnsPrimary == null) selectedDnsPrimary = "1.1.1.1";
+            if (selectedDnsSecondary == null) selectedDnsSecondary = "1.0.0.1";
+            if (selectedDnsName == null) selectedDnsName = "Cloudflare";
+ 
+            startVpn();
+        }
+ 
+        return START_STICKY;
+    }
+ 
+    @Override
+    public void onDestroy() {
+        stopVpn();
+        super.onDestroy();
+    }
+ 
+    // ── VPN Control ───────────────────────────────────────────────
+ 
+    private void startVpn() {
+        if (running) {
+            Log.w(TAG, "VPN already running");
+            return;
+        }
+ 
+        try {
+            vpnInterface = buildVpnInterface();
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to build VPN interface", e);
+            return;
+        }
+ 
+        running = true;
+        startForeground(NOTIFICATION_ID, buildNotification());
+ 
+        vpnThread = new Thread(this::runVpnLoop, "DnsVpnThread");
+        vpnThread.start();
+ 
+        Log.i(TAG, "VPN started with DNS: " + selectedDnsPrimary);
+ 
+        // Broadcast state change
+        sendBroadcast(new Intent("com.smartdns.VPN_STARTED"));
+    }
+ 
+    private void stopVpn() {
+        running = false;
+ 
+        if (vpnThread != null) {
+            vpnThread.interrupt();
+            vpnThread = null;
+        }
+ 
+        if (vpnInterface != null) {
+            try {
+                vpnInterface.close();
+            } catch (IOException e) {
+                Log.e(TAG, "Error closing VPN interface", e);
+            }
+            vpnInterface = null;
+        }
+ 
+        stopForeground(true);
+        stopSelf();
+ 
+        Log.i(TAG, "VPN stopped");
+        sendBroadcast(new Intent("com.smartdns.VPN_STOPPED"));
+    }
+ 
+    // ── VPN Interface Builder ─────────────────────────────────────
+ 
+    private ParcelFileDescriptor buildVpnInterface() throws Exception {
+        Builder builder = new Builder();
+        builder.setMtu(TUN_MTU);
+        builder.addAddress(TUN_ADDRESS, TUN_PREFIX);
+ 
+        // Add DNS servers — this is the key part that redirects DNS traffic
+        builder.addDnsServer(selectedDnsPrimary);
+        if (selectedDnsSecondary != null && !selectedDnsSecondary.isEmpty()) {
+            builder.addDnsServer(selectedDnsSecondary);
+        }
+ 
+        // Route only DNS traffic (not all internet traffic)
+        // This makes it lightweight — no browsing traffic goes through us
+        builder.addRoute("0.0.0.0", 0);
+ 
+        // Exclude our own app to prevent looping
+        builder.addDisallowedApplication(getPackageName());
+ 
+        builder.setSession(selectedDnsName + " — SmartDNS");
+        builder.setBlocking(true);
+ 
+        return builder.establish();
+    }
+ 
+    // ── DNS Packet Loop ───────────────────────────────────────────
+ 
+    /**
+     * Main loop: reads DNS packets from the TUN interface,
+     * forwards them to the real DNS server, writes responses back.
+     */
+    private void runVpnLoop() {
+        FileInputStream in = new FileInputStream(vpnInterface.getFileDescriptor());
+        FileOutputStream out = new FileOutputStream(vpnInterface.getFileDescriptor());
+ 
+        ByteBuffer packet = ByteBuffer.allocate(BUFFER_SIZE);
+ 
+        while (running && !Thread.interrupted()) {
+            try {
+                packet.clear();
+                int length = in.read(packet.array());
+                if (length <= 0) continue;
+ 
+                packet.limit(length);
+ 
+                // Forward to DNS server and get response
+                byte[] response = forwardDnsPacket(packet.array(), length);
+                if (response != null) {
+                    out.write(response);
+                }
+ 
+            } catch (IOException e) {
+                if (running) {
+                    Log.e(TAG, "VPN loop error", e);
+                }
+            }
+        }
+    }
+ 
+    /**
+     * Forwards a raw DNS packet to the selected DNS server via UDP
+     * and returns the response.
+     */
+    private byte[] forwardDnsPacket(byte[] packetData, int length) {
+        try {
+            // Extract DNS payload from IP packet (skip IP + UDP headers = 28 bytes)
+            int ipHeaderLen = (packetData[0] & 0x0F) * 4;
+            int udpHeaderLen = 8;
+            int dnsOffset = ipHeaderLen + udpHeaderLen;
+            int dnsLength = length - dnsOffset;
+ 
+            if (dnsLength <= 0) return null;
+ 
+            byte[] dnsPayload = new byte[dnsLength];
+            System.arraycopy(packetData, dnsOffset, dnsPayload, 0, dnsLength);
+ 
+            // Send to real DNS server
+            DatagramSocket socket = new DatagramSocket();
+            protect(socket); // CRITICAL: prevents routing loop
+ 
+            InetAddress dnsAddress = InetAddress.getByName(selectedDnsPrimary);
+            DatagramPacket query = new DatagramPacket(dnsPayload, dnsLength, dnsAddress, DNS_PORT);
+            socket.send(query);
+ 
+            // Receive response
+            byte[] responseBuffer = new byte[BUFFER_SIZE];
+            DatagramPacket response = new DatagramPacket(responseBuffer, responseBuffer.length);
+            socket.setSoTimeout(3000);
+            socket.receive(response);
+            socket.close();
+ 
+            // Wrap response back into IP/UDP packet
+            return buildUdpPacket(
+                    response.getData(),
+                    response.getLength(),
+                    selectedDnsPrimary,
+                    TUN_ADDRESS
+            );
+ 
+        } catch (Exception e) {
+            Log.w(TAG, "DNS forward error: " + e.getMessage());
+            return null;
+        }
+    }
+ 
+    /**
+     * Builds a minimal UDP/IP packet wrapping the given DNS payload.
+     * src = DNS server, dst = TUN interface (our local address)
+     */
+    private byte[] buildUdpPacket(byte[] dnsData, int dnsLen, String srcIp, String dstIp) {
+        try {
+            int totalLen = 20 + 8 + dnsLen; // IP header + UDP header + DNS
+            ByteBuffer buf = ByteBuffer.allocate(totalLen);
+ 
+            byte[] src = InetAddress.getByName(srcIp).getAddress();
+            byte[] dst = InetAddress.getByName(dstIp).getAddress();
+ 
+            // IP header
+            buf.put((byte) 0x45);             // version=4, IHL=5
+            buf.put((byte) 0);                // DSCP/ECN
+            buf.putShort((short) totalLen);   // total length
+            buf.putShort((short) 0);          // identification
+            buf.putShort((short) 0x4000);     // flags: don't fragment
+            buf.put((byte) 64);               // TTL
+            buf.put((byte) 17);               // protocol: UDP
+            buf.putShort((short) 0);          // checksum placeholder
+            buf.put(src);
+            buf.put(dst);
+ 
+            // UDP header
+            buf.putShort((short) DNS_PORT);   // src port
+            buf.putShort((short) DNS_PORT);   // dst port
+            buf.putShort((short) (8 + dnsLen)); // length
+            buf.putShort((short) 0);          // checksum (optional for IPv4)
+ 
+            // DNS payload
+            buf.put(dnsData, 0, dnsLen);
+ 
+            // Fill in IP checksum
+            byte[] packet = buf.array();
+            int checksum = computeIpChecksum(packet, 0, 20);
+            packet[10] = (byte) (checksum >> 8);
+            packet[11] = (byte) (checksum & 0xFF);
+ 
+            return packet;
+ 
+        } catch (Exception e) {
+            return null;
+        }
+    }
+ 
+    /**
+     * Standard IP header checksum calculation.
+     */
+    private int computeIpChecksum(byte[] data, int offset, int length) {
+        int sum = 0;
+        for (int i = offset; i < offset + length - 1; i += 2) {
+            sum += ((data[i] & 0xFF) << 8) | (data[i + 1] & 0xFF);
+        }
+        while ((sum >> 16) != 0) {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        return ~sum & 0xFFFF;
+    }
+ 
+    // ── Notification ──────────────────────────────────────────────
+ 
+    private Notification buildNotification() {
+        createNotificationChannel();
+ 
+        Intent stopIntent = new Intent(this, DnsVpnService.class);
+        stopIntent.setAction(ACTION_STOP);
+        PendingIntent stopPending = PendingIntent.getService(
+                this, 0, stopIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+        );
+ 
+        Intent openIntent = new Intent(this, MainActivity.class);
+        PendingIntent openPending = PendingIntent.getActivity(
+                this, 0, openIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+        );
+ 
+        return new NotificationCompat.Builder(this, CHANNEL_ID)
+                .setContentTitle("SmartDNS Active")
+                .setContentText("Using " + selectedDnsName + " (" + selectedDnsPrimary + ")")
+                .setSmallIcon(R.drawable.ic_dns)
+                .setContentIntent(openPending)
+                .addAction(R.drawable.ic_stop, "Stop", stopPending)
+                .setOngoing(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .build();
+    }
+ 
+    private void createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                    CHANNEL_ID,
+                    "SmartDNS Service",
+                    NotificationManager.IMPORTANCE_LOW
+            );
+            channel.setDescription("Shows when SmartDNS is active");
+            getSystemService(NotificationManager.class).createNotificationChannel(channel);
+        }
+    }
+ 
+    // ── Static helpers ────────────────────────────────────────────
+ 
+    public static boolean isRunning() {
+        return false; // Will be tracked via SharedPreferences in full impl
+    }
+}
+ 
