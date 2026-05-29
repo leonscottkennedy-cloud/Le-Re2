@@ -1,0 +1,279 @@
+package com.smartdns.app.ui;
+ 
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.net.VpnService;
+import android.os.Bundle;
+import android.view.View;
+import android.widget.TextView;
+import android.widget.Toast;
+ 
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.appcompat.app.AppCompatActivity;
+ 
+import com.google.android.material.button.MaterialButton;
+import com.google.android.material.card.MaterialCardView;
+import com.google.android.material.switchmaterial.SwitchMaterial;
+import com.smartdns.app.R;
+import com.smartdns.app.model.DnsServer;
+import com.smartdns.app.service.DnsVpnService;
+import com.smartdns.app.utils.DnsBenchmark;
+ 
+import java.util.List;
+ 
+/**
+ * Main screen with two modes:
+ *  - Simple: one big button, auto-picks best DNS
+ *  - Advanced: shows all servers, ping stats, manual selection
+ */
+public class MainActivity extends AppCompatActivity {
+ 
+    private static final int VPN_REQUEST_CODE = 100;
+ 
+    // UI
+    private MaterialButton btnMainToggle;
+    private TextView tvStatus;
+    private TextView tvCurrentDns;
+    private TextView tvPingBefore;
+    private TextView tvPingAfter;
+    private MaterialCardView cardAdvanced;
+    private SwitchMaterial switchAdvancedMode;
+ 
+    // State
+    private boolean isVpnRunning = false;
+    private boolean isAdvancedMode = false;
+    private DnsServer selectedServer = null;
+    private DnsBenchmark benchmark;
+ 
+    // VPN permission launcher
+    private ActivityResultLauncher<Intent> vpnPermissionLauncher;
+ 
+    // Broadcast receiver for VPN state changes
+    private final BroadcastReceiver vpnStateReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if ("com.smartdns.VPN_STARTED".equals(intent.getAction())) {
+                onVpnStarted();
+            } else if ("com.smartdns.VPN_STOPPED".equals(intent.getAction())) {
+                onVpnStopped();
+            }
+        }
+    };
+ 
+    // ── Lifecycle ─────────────────────────────────────────────────
+ 
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+ 
+        initViews();
+        setupVpnPermissionLauncher();
+        setupListeners();
+        restoreState();
+    }
+ 
+    @Override
+    protected void onResume() {
+        super.onResume();
+        IntentFilter filter = new IntentFilter();
+        filter.addAction("com.smartdns.VPN_STARTED");
+        filter.addAction("com.smartdns.VPN_STOPPED");
+        registerReceiver(vpnStateReceiver, filter);
+    }
+ 
+    @Override
+    protected void onPause() {
+        super.onPause();
+        unregisterReceiver(vpnStateReceiver);
+    }
+ 
+    @Override
+    protected void onDestroy() {
+        if (benchmark != null) benchmark.cancel();
+        super.onDestroy();
+    }
+ 
+    // ── Init ──────────────────────────────────────────────────────
+ 
+    private void initViews() {
+        btnMainToggle     = findViewById(R.id.btn_main_toggle);
+        tvStatus          = findViewById(R.id.tv_status);
+        tvCurrentDns      = findViewById(R.id.tv_current_dns);
+        tvPingBefore      = findViewById(R.id.tv_ping_before);
+        tvPingAfter       = findViewById(R.id.tv_ping_after);
+        cardAdvanced      = findViewById(R.id.card_advanced);
+        switchAdvancedMode = findViewById(R.id.switch_advanced_mode);
+    }
+ 
+    private void setupVpnPermissionLauncher() {
+        vpnPermissionLauncher = registerForActivityResult(
+                new ActivityResultContracts.StartActivityForResult(),
+                result -> {
+                    if (result.getResultCode() == RESULT_OK) {
+                        startVpnService();
+                    } else {
+                        Toast.makeText(this, "VPN permission denied", Toast.LENGTH_SHORT).show();
+                    }
+                }
+        );
+    }
+ 
+    private void setupListeners() {
+        btnMainToggle.setOnClickListener(v -> onMainButtonClick());
+ 
+        switchAdvancedMode.setOnCheckedChangeListener((btn, checked) -> {
+            isAdvancedMode = checked;
+            cardAdvanced.setVisibility(checked ? View.VISIBLE : View.GONE);
+        });
+ 
+        findViewById(R.id.btn_benchmark).setOnClickListener(v ->
+                startActivity(new Intent(this, BenchmarkActivity.class))
+        );
+ 
+        findViewById(R.id.btn_settings).setOnClickListener(v ->
+                startActivity(new Intent(this, SettingsActivity.class))
+        );
+    }
+ 
+    private void restoreState() {
+        // Default server is Cloudflare
+        selectedServer = DnsServer.cloudflare();
+        updateUI();
+    }
+ 
+    // ── Main Button Logic ─────────────────────────────────────────
+ 
+    private void onMainButtonClick() {
+        if (isVpnRunning) {
+            stopVpnService();
+        } else {
+            if (isAdvancedMode && selectedServer != null) {
+                // Advanced: use the manually selected server
+                requestVpnPermissionAndStart();
+            } else {
+                // Simple: auto-find best DNS first
+                findBestDnsAndStart();
+            }
+        }
+    }
+ 
+    /**
+     * Simple mode: benchmark all servers, pick the fastest, then start VPN.
+     */
+    private void findBestDnsAndStart() {
+        setUiLoading(true);
+        tvStatus.setText("Finding best DNS for you...");
+ 
+        benchmark = new DnsBenchmark();
+        List<DnsServer> servers = DnsBenchmark.getDefaultServers();
+ 
+        new Thread(() -> {
+            benchmark.run(servers, new DnsBenchmark.Callback() {
+                @Override
+                public void onResult(DnsServer server, long pingMs) {
+                    runOnUiThread(() ->
+                            tvStatus.setText("Testing " + server.getName() + "... " + server.getPingDisplay())
+                    );
+                }
+ 
+                @Override
+                public void onComplete(List<DnsServer> sortedByPing) {
+                    runOnUiThread(() -> {
+                        setUiLoading(false);
+                        if (!sortedByPing.isEmpty() && sortedByPing.get(0).getLastPingMs() >= 0) {
+                            selectedServer = sortedByPing.get(0);
+                            tvStatus.setText("Best DNS: " + selectedServer.getName());
+                            requestVpnPermissionAndStart();
+                        } else {
+                            tvStatus.setText("Could not reach any DNS server");
+                            Toast.makeText(MainActivity.this,
+                                    "Check your internet connection", Toast.LENGTH_SHORT).show();
+                        }
+                    });
+                }
+ 
+                @Override
+                public void onError(String message) {
+                    runOnUiThread(() -> {
+                        setUiLoading(false);
+                        Toast.makeText(MainActivity.this, "Error: " + message, Toast.LENGTH_SHORT).show();
+                    });
+                }
+            });
+        }).start();
+    }
+ 
+    // ── VPN Control ───────────────────────────────────────────────
+ 
+    private void requestVpnPermissionAndStart() {
+        Intent permIntent = VpnService.prepare(this);
+        if (permIntent != null) {
+            vpnPermissionLauncher.launch(permIntent);
+        } else {
+            startVpnService();
+        }
+    }
+ 
+    private void startVpnService() {
+        if (selectedServer == null) {
+            selectedServer = DnsServer.cloudflare();
+        }
+ 
+        Intent intent = new Intent(this, DnsVpnService.class);
+        intent.setAction(DnsVpnService.ACTION_START);
+        intent.putExtra(DnsVpnService.EXTRA_DNS_PRIMARY, selectedServer.getPrimaryDns());
+        intent.putExtra(DnsVpnService.EXTRA_DNS_SECONDARY, selectedServer.getSecondaryDns());
+        intent.putExtra(DnsVpnService.EXTRA_DNS_NAME, selectedServer.getName());
+        startService(intent);
+    }
+ 
+    private void stopVpnService() {
+        Intent intent = new Intent(this, DnsVpnService.class);
+        intent.setAction(DnsVpnService.ACTION_STOP);
+        startService(intent);
+    }
+ 
+    // ── State Callbacks ───────────────────────────────────────────
+ 
+    private void onVpnStarted() {
+        isVpnRunning = true;
+        updateUI();
+        tvPingAfter.setText("Measuring...");
+        // TODO: measure ping after DNS change
+    }
+ 
+    private void onVpnStopped() {
+        isVpnRunning = false;
+        updateUI();
+    }
+ 
+    // ── UI Helpers ────────────────────────────────────────────────
+ 
+    private void updateUI() {
+        if (isVpnRunning) {
+            btnMainToggle.setText("Stop");
+            btnMainToggle.setBackgroundTintList(
+                    getColorStateList(com.google.android.material.R.color.design_default_color_error)
+            );
+            tvStatus.setText("SmartDNS Active 🟢");
+            tvCurrentDns.setText(selectedServer != null ? selectedServer.getName() + " — " + selectedServer.getPrimaryDns() : "—");
+        } else {
+            btnMainToggle.setText("Start SmartDNS");
+            btnMainToggle.setBackgroundTintList(
+                    getColorStateList(androidx.appcompat.R.color.primary_dark_material_light)
+            );
+            tvStatus.setText("Tap to boost your game 🎮");
+            tvCurrentDns.setText("—");
+        }
+    }
+ 
+    private void setUiLoading(boolean loading) {
+        btnMainToggle.setEnabled(!loading);
+        btnMainToggle.setText(loading ? "Scanning..." : "Start SmartDNS");
+    }
+}
+ 
