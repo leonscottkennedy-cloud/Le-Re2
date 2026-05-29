@@ -1,0 +1,153 @@
+package com.smartdns.app.utils;
+ 
+import com.smartdns.app.model.DnsServer;
+ 
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+ 
+/**
+ * Benchmarks multiple DNS servers concurrently and returns them sorted by ping.
+ *
+ * Usage:
+ *   DnsBenchmark benchmark = new DnsBenchmark();
+ *   benchmark.run(servers, new DnsBenchmark.Callback() {
+ *       void onResult(DnsServer server, long pingMs) { ... }
+ *       void onComplete(List<DnsServer> sorted) { ... }
+ *   });
+ */
+public class DnsBenchmark {
+ 
+    private static final int PING_TIMEOUT_MS = 2000;
+    private static final int DNS_PORT = 53;
+    private static final int ROUNDS = 3;          // average over 3 attempts
+    private static final String TEST_HOST = "8.8.8.8"; // used for TCP connect test
+ 
+    public interface Callback {
+        void onResult(DnsServer server, long pingMs);
+        void onComplete(List<DnsServer> sortedByPing);
+        void onError(String message);
+    }
+ 
+    private ExecutorService executor;
+    private volatile boolean cancelled = false;
+ 
+    /**
+     * Run benchmark on all servers concurrently.
+     * Results are delivered on the calling thread via callback.
+     * Call cancel() to stop early.
+     */
+    public void run(List<DnsServer> servers, Callback callback) {
+        cancelled = false;
+        executor = Executors.newFixedThreadPool(Math.min(servers.size(), 8));
+ 
+        List<Future<Void>> futures = new ArrayList<>();
+ 
+        for (DnsServer server : servers) {
+            futures.add(executor.submit(() -> {
+                if (cancelled) return null;
+ 
+                long ping = measurePing(server);
+                server.setLastPingMs(ping);
+ 
+                if (!cancelled && callback != null) {
+                    callback.onResult(server, ping);
+                }
+                return null;
+            }));
+        }
+ 
+        // Wait for all to complete
+        executor.shutdown();
+        try {
+            executor.awaitTermination(10, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+ 
+        if (!cancelled && callback != null) {
+            List<DnsServer> sorted = new ArrayList<>(servers);
+            Collections.sort(sorted, (a, b) -> {
+                long pa = a.getLastPingMs();
+                long pb = b.getLastPingMs();
+                // unreachable servers go to end
+                if (pa < 0 && pb < 0) return 0;
+                if (pa < 0) return 1;
+                if (pb < 0) return -1;
+                return Long.compare(pa, pb);
+            });
+            callback.onComplete(sorted);
+        }
+    }
+ 
+    /**
+     * Measure average ping to a DNS server over multiple rounds.
+     * Uses TCP connect to port 53 (fast and reliable for latency measurement).
+     * Returns -1 if unreachable.
+     */
+    private long measurePing(DnsServer server) {
+        String host = server.getPrimaryDns();
+        if (host == null || host.isEmpty()) return -1;
+ 
+        long total = 0;
+        int successful = 0;
+ 
+        for (int i = 0; i < ROUNDS; i++) {
+            long ping = tcpPing(host, DNS_PORT);
+            if (ping >= 0) {
+                total += ping;
+                successful++;
+            }
+        }
+ 
+        if (successful == 0) return -1;
+        return total / successful;
+    }
+ 
+    /**
+     * Single TCP connect ping measurement in milliseconds.
+     */
+    private long tcpPing(String host, int port) {
+        try {
+            long start = System.currentTimeMillis();
+            Socket socket = new Socket();
+            socket.connect(new InetSocketAddress(host, port), PING_TIMEOUT_MS);
+            socket.close();
+            return System.currentTimeMillis() - start;
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+ 
+    /**
+     * Cancel an ongoing benchmark.
+     */
+    public void cancel() {
+        cancelled = true;
+        if (executor != null) {
+            executor.shutdownNow();
+        }
+    }
+ 
+    /**
+     * Returns the default list of servers to benchmark.
+     */
+    public static List<DnsServer> getDefaultServers() {
+        List<DnsServer> servers = new ArrayList<>();
+        servers.add(DnsServer.cloudflare());
+        servers.add(DnsServer.google());
+        servers.add(DnsServer.quad9());
+        servers.add(DnsServer.adguard());
+        servers.add(DnsServer.shecan());
+        servers.add(DnsServer.electro());
+        return servers;
+    }
+}
