@@ -1,0 +1,127 @@
+package com.smartdns.app.model;
+ 
+/**
+ * Represents a DNS server with its metadata and benchmark results.
+ */
+public class DnsServer {
+ 
+    public enum Protocol {
+        UDP,    // Standard DNS (port 53)
+        TCP,    // DNS over TCP
+        DOH,    // DNS over HTTPS
+        DOT     // DNS over TLS
+    }
+ 
+    private String name;
+    private String primaryDns;
+    private String secondaryDns;
+    private Protocol protocol;
+    private String dohUrl;         // only for DoH
+    private boolean isCustom;
+    private long lastPingMs;       // last measured ping
+    private boolean isSelected;
+ 
+    // ── Constructors ──────────────────────────────────────────────
+ 
+    public DnsServer(String name, String primaryDns, String secondaryDns, Protocol protocol) {
+        this.name = name;
+        this.primaryDns = primaryDns;
+        this.secondaryDns = secondaryDns;
+        this.protocol = protocol;
+        this.isCustom = false;
+        this.lastPingMs = -1;
+    }
+ 
+    // DoH constructor
+    public DnsServer(String name, String dohUrl) {
+        this.name = name;
+        this.dohUrl = dohUrl;
+        this.protocol = Protocol.DOH;
+        this.isCustom = false;
+        this.lastPingMs = -1;
+    }
+ 
+    // ── Built-in servers ──────────────────────────────────────────
+ 
+    public static DnsServer cloudflare() {
+        return new DnsServer("Cloudflare", "1.1.1.1", "1.0.0.1", Protocol.UDP);
+    }
+ 
+    public static DnsServer cloudflareGaming() {
+        // 1.1.1.1 with gaming optimizations
+        DnsServer s = new DnsServer("Cloudflare Gaming", "1.1.1.1", "1.0.0.1", Protocol.UDP);
+        return s;
+    }
+ 
+    public static DnsServer google() {
+        return new DnsServer("Google", "8.8.8.8", "8.8.4.4", Protocol.UDP);
+    }
+ 
+    public static DnsServer quad9() {
+        return new DnsServer("Quad9 (Secure)", "9.9.9.9", "149.112.112.112", Protocol.UDP);
+    }
+ 
+    public static DnsServer adguard() {
+        return new DnsServer("AdGuard", "94.140.14.14", "94.140.15.15", Protocol.UDP);
+    }
+ 
+    public static DnsServer shecan() {
+        // Popular in Iran
+        return new DnsServer("Shecan", "178.22.122.100", "185.51.200.2", Protocol.UDP);
+    }
+ 
+    public static DnsServer electro() {
+        return new DnsServer("Electro", "78.157.42.100", "78.157.42.101", Protocol.UDP);
+    }
+ 
+    public static DnsServer cloudflareDoH() {
+        return new DnsServer("Cloudflare DoH", "https://cloudflare-dns.com/dns-query");
+    }
+ 
+    public static DnsServer googleDoH() {
+        return new DnsServer("Google DoH", "https://dns.google/dns-query");
+    }
+ 
+    // ── Getters & Setters ─────────────────────────────────────────
+ 
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+ 
+    public String getPrimaryDns() { return primaryDns; }
+    public void setPrimaryDns(String primaryDns) { this.primaryDns = primaryDns; }
+ 
+    public String getSecondaryDns() { return secondaryDns; }
+    public void setSecondaryDns(String secondaryDns) { this.secondaryDns = secondaryDns; }
+ 
+    public Protocol getProtocol() { return protocol; }
+    public void setProtocol(Protocol protocol) { this.protocol = protocol; }
+ 
+    public String getDohUrl() { return dohUrl; }
+    public void setDohUrl(String dohUrl) { this.dohUrl = dohUrl; }
+ 
+    public boolean isCustom() { return isCustom; }
+    public void setCustom(boolean custom) { isCustom = custom; }
+ 
+    public long getLastPingMs() { return lastPingMs; }
+    public void setLastPingMs(long lastPingMs) { this.lastPingMs = lastPingMs; }
+ 
+    public boolean isSelected() { return isSelected; }
+    public void setSelected(boolean selected) { isSelected = selected; }
+ 
+    public String getPingDisplay() {
+        if (lastPingMs < 0) return "—";
+        if (lastPingMs > 999) return "999+ ms";
+        return lastPingMs + " ms";
+    }
+ 
+    public String getAddress() {
+        if (protocol == Protocol.DOH) return dohUrl;
+        return primaryDns;
+    }
+ 
+    @Override
+    public String toString() {
+        return name + " (" + primaryDns + ") — " + getPingDisplay();
+    }
+}
+ 
